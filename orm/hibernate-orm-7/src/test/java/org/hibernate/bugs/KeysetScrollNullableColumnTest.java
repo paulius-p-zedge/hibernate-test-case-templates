@@ -3,6 +3,7 @@ package org.hibernate.bugs;
 import java.math.BigDecimal;
 import java.util.List;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -25,15 +26,18 @@ import org.hibernate.query.KeyedResultList;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Regression in Hibernate 7.2+: keyset scroll generates incorrect WHERE clauses
+ * Regression in Hibernate 7.x: keyset pagination generates incorrect WHERE clauses
  * for nullable sort columns.
  * <p>
- * Expected (6.6.x): {@code WHERE (i.score < ? OR i.score IS NULL AND i.sort_order > ? ...)}
- * Actual (7.2+):     {@code WHERE (i.score IS NOT NULL OR i.score IS NULL AND i.sort_order > ? ...)}
+ * When the first sort key is nullable (e.g. a score that can be NULL), the keyset
+ * WHERE clause replaces cursor value comparisons with null-existence checks:
+ * <ul>
+ *   <li>Forward: generates {@code score IS NOT NULL} instead of {@code score < ?}</li>
+ *   <li>Backward: generates {@code score IS NULL} instead of {@code score > ?}</li>
+ * </ul>
+ * This causes items to be lost or duplicated across pages.
  * <p>
- * The cursor value comparison is replaced with a null-existence check, breaking pagination.
- * In the original use case the nullable column comes from a LEFT JOIN (@OneToOne),
- * but the same issue applies to any nullable sort column.
+ * Works correctly in Hibernate 6.6.x.
  */
 class KeysetScrollNullableColumnTest {
 
@@ -50,8 +54,8 @@ class KeysetScrollNullableColumnTest {
 	}
 
 	@SuppressWarnings("unchecked")
-	private static KeyedPage<Item> firstPage() {
-		return Page.first(2).keyedBy((List<Order<? super Item>>) (List<?>) List.of(
+	private static KeyedPage<Item> firstPage(int size) {
+		return Page.first(size).keyedBy((List<Order<? super Item>>) (List<?>) List.of(
 				Order.desc(Item.class, "score"),
 				Order.desc(Item.class, "sortOrder"),
 				Order.desc(Item.class, "id")
@@ -59,11 +63,13 @@ class KeysetScrollNullableColumnTest {
 	}
 
 	/**
-	 * All items have NULL score. Backward pagination returns wrong results because
-	 * the WHERE clause degenerates to {@code score IS NULL} matching all rows.
+	 * 6 items, all with NULL score, paginated 2-at-a-time.
+	 * Expected: 3 pages of 2 items each, all 6 items covered.
+	 * Actual: page 2 returns 0 items — the keyset WHERE clause fails
+	 * to find any rows after the cursor when all scores are NULL.
 	 */
 	@Test
-	void keysetBackwardPaginationWithAllNullScores() {
+	void allNullScores_forwardPaginationLosesItems() {
 		EntityManager em = entityManagerFactory.createEntityManager();
 		em.getTransaction().begin();
 		for (int i = 0; i < 6; i++) {
@@ -71,7 +77,7 @@ class KeysetScrollNullableColumnTest {
 			item.id = UUID.randomUUID();
 			item.title = "Item " + i;
 			item.sortOrder = i;
-			// score is left null
+			// score left NULL
 			em.persist(item);
 		}
 		em.getTransaction().commit();
@@ -79,39 +85,23 @@ class KeysetScrollNullableColumnTest {
 		Session session = em.unwrap(Session.class);
 		var query = session.createSelectionQuery("FROM KeysetNullItem", Item.class);
 
-		// Forward through 3 pages of 2
-		KeyedResultList<Item> page1 = query.getKeyedResultList(firstPage());
-		assertEquals(2, page1.getResultList().size());
-		assertNotNull(page1.getNextPage());
+		KeyedResultList<Item> page1 = query.getKeyedResultList(firstPage(2));
+		assertEquals(2, page1.getResultList().size(), "Page 1 should have 2 items");
 
 		KeyedResultList<Item> page2 = query.getKeyedResultList(page1.getNextPage());
-		assertEquals(2, page2.getResultList().size());
-		assertNotNull(page2.getNextPage());
-
-		KeyedResultList<Item> page3 = query.getKeyedResultList(page2.getNextPage());
-		assertEquals(2, page3.getResultList().size());
-
-		// Backward: page 3 → page 2
-		assertNotNull(page3.getPreviousPage(), "Page 3 should have previous page");
-		KeyedResultList<Item> backPage2 = query.getKeyedResultList(page3.getPreviousPage());
-
-		assertEquals(2, backPage2.getResultList().size(),
-				"Backward page should contain exactly 2 items");
-		assertEquals(
-				page2.getResultList().stream().map(i -> i.id).toList(),
-				backPage2.getResultList().stream().map(i -> i.id).toList(),
-				"Backward page 2 should match forward page 2"
-		);
+		assertEquals(2, page2.getResultList().size(),
+				"Page 2 should have 2 items — but keyset WHERE clause returns 0 when all scores are NULL");
 
 		em.close();
 	}
 
 	/**
-	 * Mixed null/non-null scores. Forward pagination may produce duplicates because
-	 * {@code IS NOT NULL} matches all scored rows regardless of cursor value.
+	 * 3 scored + 3 unscored items, sorted by score DESC NULLS LAST.
+	 * Expected: 3 pages of 2, all 6 items covered with no duplicates.
+	 * Actual: only 3 items are returned across all pages — the unscored items are lost.
 	 */
 	@Test
-	void keysetForwardPaginationWithMixedNullScores() {
+	void mixedNullScores_forwardPaginationLosesUnscoredItems() {
 		EntityManager em = entityManagerFactory.createEntityManager();
 		em.getTransaction().begin();
 		for (int i = 0; i < 3; i++) {
@@ -127,7 +117,7 @@ class KeysetScrollNullableColumnTest {
 			item.id = UUID.randomUUID();
 			item.title = "Unscored " + i;
 			item.sortOrder = 20 + i;
-			// score left null
+			// score left NULL
 			em.persist(item);
 		}
 		em.getTransaction().commit();
@@ -135,23 +125,17 @@ class KeysetScrollNullableColumnTest {
 		Session session = em.unwrap(Session.class);
 		var query = session.createSelectionQuery("FROM KeysetNullItem", Item.class);
 
-		KeyedResultList<Item> page1 = query.getKeyedResultList(firstPage());
-		assertEquals(2, page1.getResultList().size());
+		var allItems = new java.util.ArrayList<Item>();
+		KeyedPage<Item> nextPage = firstPage(2);
+		while (nextPage != null) {
+			KeyedResultList<Item> page = query.getKeyedResultList(nextPage);
+			allItems.addAll(page.getResultList());
+			nextPage = page.getNextPage();
+		}
 
-		KeyedResultList<Item> page2 = query.getKeyedResultList(page1.getNextPage());
-		assertEquals(2, page2.getResultList().size());
-
-		KeyedResultList<Item> page3 = query.getKeyedResultList(page2.getNextPage());
-		assertEquals(2, page3.getResultList().size());
-
-		// Verify no duplicates across pages
-		var allIds = new java.util.HashSet<UUID>();
-		page1.getResultList().forEach(i -> assertTrue(allIds.add(i.id), "Duplicate: " + i.title));
-		page2.getResultList().forEach(i -> assertTrue(allIds.add(i.id), "Duplicate: " + i.title));
-		page3.getResultList().forEach(i -> assertTrue(allIds.add(i.id), "Duplicate: " + i.title));
-		assertEquals(6, allIds.size(), "All 6 items should appear exactly once across 3 pages");
-
-		em.close();
+		assertEquals(6, allItems.size(),
+				"All 6 items should be reachable via forward pagination, but only found: "
+						+ allItems.stream().map(i -> i.title).collect(Collectors.joining(", ")));
 	}
 
 	@Entity(name = "KeysetNullItem")
