@@ -98,8 +98,24 @@ class KeysetScrollNullableColumnTest {
 		assertTrue(page1.hasNext(), "Should have more pages");
 
 		Window<Item> page2 = scroll(repo, positionAfter(em, page1.getContent().get(1)));
-		assertEquals(2, page2.getContent().size(),
-				"Page 2 should have 2 items — keyset WHERE clause drops items with NULL scores");
+		assertEquals(2, page2.getContent().size(), "Page 2 should have 2 items");
+
+		Window<Item> page3 = scroll(repo, positionAfter(em, page2.getContent().get(1)));
+		assertEquals(2, page3.getContent().size(), "Page 3 should have 2 items");
+
+		// Backward from page 3's first item
+		var backKeys = new LinkedHashMap<String, Object>();
+		var firstOfPage3 = page3.getContent().get(0);
+		ItemScore backScore = em.find(ItemScore.class, firstOfPage3.id);
+		backKeys.put("score.value", backScore != null ? backScore.value : null);
+		backKeys.put("sortOrder", firstOfPage3.sortOrder);
+		backKeys.put("id", firstOfPage3.id);
+		ScrollPosition backPosition = ScrollPosition.backward(backKeys);
+
+		System.out.println("=== Backward scroll ===");
+		Window<Item> backPage = scroll(repo, backPosition);
+		assertEquals(2, backPage.getContent().size(),
+				"Backward page should have 2 items matching page 2");
 
 		em.close();
 	}
