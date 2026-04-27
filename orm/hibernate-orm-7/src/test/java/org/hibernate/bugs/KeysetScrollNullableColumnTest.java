@@ -2,11 +2,9 @@ package org.hibernate.bugs;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.UUID;
-import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -23,8 +21,6 @@ import jakarta.persistence.Persistence;
 import jakarta.persistence.PrimaryKeyJoinColumn;
 import jakarta.persistence.Table;
 
-import org.springframework.data.domain.KeysetScrollPosition;
-import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.ScrollPosition;
 import org.springframework.data.domain.Sort;
 import org.springframework.data.domain.Window;
@@ -61,8 +57,7 @@ class KeysetScrollNullableColumnTest {
 
 	private Window<Item> scroll(SimpleJpaRepository<Item, UUID> repo, ScrollPosition position) {
 		Specification<Item> spec = (root, query, cb) -> null;
-		return repo.findBy(spec, q ->
-				q.limit(2).sortBy(SORT).scroll(position));
+		return repo.findBy(spec, q -> q.limit(2).sortBy(SORT).scroll(position));
 	}
 
 	private ScrollPosition positionAfter(EntityManager em, Item item) {
@@ -87,69 +82,84 @@ class KeysetScrollNullableColumnTest {
 		return window.getContent().stream().map(i -> i.id).toList();
 	}
 
+	private List<UUID> ids(List<Item> items) {
+		return items.stream().map(i -> i.id).toList();
+	}
+
 	/**
-	 * 6 items, no scores. Forward + backward pagination with full ID assertions.
+	 * 6 items, no scores. Forward + backward pagination.
+	 * Sort: score DESC NULLS LAST (all null), sortOrder DESC, id DESC.
+	 * Expected order: Item 5, 4, 3, 2, 1, 0 (by sortOrder DESC).
 	 */
 	@Test
 	void allNullScores_forwardAndBackwardPagination() {
 		EntityManager em = entityManagerFactory.createEntityManager();
 		em.getTransaction().begin();
+		var items = new ArrayList<Item>();
 		for (int i = 0; i < 6; i++) {
 			Item item = new Item();
 			item.id = UUID.randomUUID();
 			item.title = "Item " + i;
 			item.sortOrder = i;
 			em.persist(item);
+			items.add(item);
 		}
 		em.getTransaction().commit();
+
+		// Expected order: sortOrder DESC (all scores null, so secondary key decides)
+		var expectedOrder = new ArrayList<>(items);
+		java.util.Collections.reverse(expectedOrder); // [Item 5, 4, 3, 2, 1, 0]
+		var expectedPage1Ids = ids(expectedOrder.subList(0, 2));
+		var expectedPage2Ids = ids(expectedOrder.subList(2, 4));
+		var expectedPage3Ids = ids(expectedOrder.subList(4, 6));
 
 		var entityInfo = new JpaMetamodelEntityInformation<Item, UUID>(
 				Item.class, em.getMetamodel(), em.getEntityManagerFactory().getPersistenceUnitUtil());
 		var repo = new SimpleJpaRepository<Item, UUID>(entityInfo, em);
 
-		// Forward: 3 pages of 2
+		// Forward page 1
 		Window<Item> page1 = scroll(repo, ScrollPosition.keyset());
-		assertEquals(2, page1.getContent().size(), "Page 1 size");
+		assertEquals(expectedPage1Ids, ids(page1), "Forward page 1 items");
 
+		// Forward page 2
 		Window<Item> page2 = scroll(repo, positionAfter(em, page1.getContent().get(1)));
-		assertEquals(2, page2.getContent().size(), "Page 2 size");
+		assertEquals(expectedPage2Ids, ids(page2), "Forward page 2 items");
 
+		// Forward page 3
 		Window<Item> page3 = scroll(repo, positionAfter(em, page2.getContent().get(1)));
-		assertEquals(2, page3.getContent().size(), "Page 3 size");
+		assertEquals(expectedPage3Ids, ids(page3), "Forward page 3 items");
 
-		// All 6 unique items across forward pages
-		var allForwardIds = new HashSet<UUID>();
-		allForwardIds.addAll(ids(page1));
-		allForwardIds.addAll(ids(page2));
-		allForwardIds.addAll(ids(page3));
-		assertEquals(6, allForwardIds.size(), "Forward should cover all 6 items without duplicates");
-
-		// Backward from page 3's first item should return page 2's items
+		// Backward from page 3's first item → should return page 2
 		Window<Item> backFromPage3 = scroll(repo, positionBefore(em, page3.getContent().get(0)));
-		assertEquals(ids(page2), ids(backFromPage3),
+		assertEquals(expectedPage2Ids, ids(backFromPage3),
 				"Backward from page 3 should return page 2's items");
 
-		// Backward from page 2's first item should return page 1's items
+		// Backward from page 2's first item → should return page 1
 		Window<Item> backFromPage2 = scroll(repo, positionBefore(em, backFromPage3.getContent().get(0)));
-		assertEquals(ids(page1), ids(backFromPage2),
+		assertEquals(expectedPage1Ids, ids(backFromPage2),
 				"Backward from page 2 should return page 1's items");
 
 		em.close();
 	}
 
 	/**
-	 * 3 scored + 3 unscored items. All 6 should be reachable with no duplicates.
+	 * 3 scored + 3 unscored items sorted by score DESC NULLS LAST.
+	 * Expected order: Scored 0 (100), Scored 1 (99), Scored 2 (98), Unscored 2, 1, 0.
+	 * All 6 should be reachable via forward pagination with no duplicates.
 	 */
 	@Test
-	void mixedNullScores_paginationLosesUnscoredItems() {
+	void mixedNullScores_forwardPaginationLosesUnscoredItems() {
 		EntityManager em = entityManagerFactory.createEntityManager();
 		em.getTransaction().begin();
+		var scoredItems = new ArrayList<Item>();
+		var unscoredItems = new ArrayList<Item>();
 		for (int i = 0; i < 3; i++) {
 			Item item = new Item();
 			item.id = UUID.randomUUID();
 			item.title = "Scored " + i;
 			item.sortOrder = 10 + i;
 			em.persist(item);
+			scoredItems.add(item);
 
 			ItemScore score = new ItemScore();
 			score.itemId = item.id;
@@ -163,29 +173,34 @@ class KeysetScrollNullableColumnTest {
 			item.title = "Unscored " + i;
 			item.sortOrder = 20 + i;
 			em.persist(item);
+			unscoredItems.add(item);
 		}
 		em.getTransaction().commit();
+
+		// Expected: scored first (by score DESC), then unscored (by sortOrder DESC)
+		var expectedAllIds = new ArrayList<UUID>();
+		expectedAllIds.addAll(ids(scoredItems));                // Scored 0 (100), 1 (99), 2 (98)
+		var unscoredReversed = new ArrayList<>(unscoredItems);
+		java.util.Collections.reverse(unscoredReversed);
+		expectedAllIds.addAll(ids(unscoredReversed));           // Unscored 2 (22), 1 (21), 0 (20)
 
 		var entityInfo = new JpaMetamodelEntityInformation<Item, UUID>(
 				Item.class, em.getMetamodel(), em.getEntityManagerFactory().getPersistenceUnitUtil());
 		var repo = new SimpleJpaRepository<Item, UUID>(entityInfo, em);
 
-		var allItems = new ArrayList<Item>();
-		var allIds = new HashSet<UUID>();
+		var actualAllIds = new ArrayList<UUID>();
 		ScrollPosition position = ScrollPosition.keyset();
 		while (true) {
 			Window<Item> page = scroll(repo, position);
 			if (page.getContent().isEmpty()) break;
-			for (Item item : page.getContent()) {
-				assertTrue(allIds.add(item.id), "Duplicate item: " + item.title);
-			}
-			allItems.addAll(page.getContent());
+			actualAllIds.addAll(ids(page));
 			position = positionAfter(em, page.getContent().get(page.getContent().size() - 1));
 		}
 
-		assertEquals(6, allItems.size(),
-				"All 6 items should be reachable, but only found: "
-						+ allItems.stream().map(i -> i.title).collect(Collectors.joining(", ")));
+		assertEquals(expectedAllIds, actualAllIds,
+				"All 6 items in correct order: scored first (by score DESC), then unscored (by sortOrder DESC)");
+
+		em.close();
 	}
 
 	@Entity(name = "Item")
