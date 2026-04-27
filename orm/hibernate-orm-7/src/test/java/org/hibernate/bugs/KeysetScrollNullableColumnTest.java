@@ -2,8 +2,11 @@ package org.hibernate.bugs;
 
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -34,9 +37,7 @@ import static org.junit.jupiter.api.Assertions.*;
 /**
  * Keyset scroll via Spring Data JPA's {@code findBy().scroll()} generates
  * incorrect WHERE clauses for nullable LEFT JOIN sort columns.
- * <p>
  * Items with NULL sort values become unreachable during pagination.
- * Works correctly with Hibernate 6.6.x / Spring Data 3.x.
  */
 class KeysetScrollNullableColumnTest {
 
@@ -73,11 +74,24 @@ class KeysetScrollNullableColumnTest {
 		return ScrollPosition.forward(keys);
 	}
 
+	private ScrollPosition positionBefore(EntityManager em, Item item) {
+		var keys = new LinkedHashMap<String, Object>();
+		ItemScore score = em.find(ItemScore.class, item.id);
+		keys.put("score.value", score != null ? score.value : null);
+		keys.put("sortOrder", item.sortOrder);
+		keys.put("id", item.id);
+		return ScrollPosition.backward(keys);
+	}
+
+	private List<UUID> ids(Window<Item> window) {
+		return window.getContent().stream().map(i -> i.id).toList();
+	}
+
 	/**
-	 * 6 items, no scores (LEFT JOIN produces NULL). Forward pagination loses items.
+	 * 6 items, no scores. Forward + backward pagination with full ID assertions.
 	 */
 	@Test
-	void allNullScores_paginationLosesItems() {
+	void allNullScores_forwardAndBackwardPagination() {
 		EntityManager em = entityManagerFactory.createEntityManager();
 		em.getTransaction().begin();
 		for (int i = 0; i < 6; i++) {
@@ -93,35 +107,38 @@ class KeysetScrollNullableColumnTest {
 				Item.class, em.getMetamodel(), em.getEntityManagerFactory().getPersistenceUnitUtil());
 		var repo = new SimpleJpaRepository<Item, UUID>(entityInfo, em);
 
+		// Forward: 3 pages of 2
 		Window<Item> page1 = scroll(repo, ScrollPosition.keyset());
-		assertEquals(2, page1.getContent().size(), "Page 1 should have 2 items");
-		assertTrue(page1.hasNext(), "Should have more pages");
+		assertEquals(2, page1.getContent().size(), "Page 1 size");
 
 		Window<Item> page2 = scroll(repo, positionAfter(em, page1.getContent().get(1)));
-		assertEquals(2, page2.getContent().size(), "Page 2 should have 2 items");
+		assertEquals(2, page2.getContent().size(), "Page 2 size");
 
 		Window<Item> page3 = scroll(repo, positionAfter(em, page2.getContent().get(1)));
-		assertEquals(2, page3.getContent().size(), "Page 3 should have 2 items");
+		assertEquals(2, page3.getContent().size(), "Page 3 size");
 
-		// Backward from page 3's first item
-		var backKeys = new LinkedHashMap<String, Object>();
-		var firstOfPage3 = page3.getContent().get(0);
-		ItemScore backScore = em.find(ItemScore.class, firstOfPage3.id);
-		backKeys.put("score.value", backScore != null ? backScore.value : null);
-		backKeys.put("sortOrder", firstOfPage3.sortOrder);
-		backKeys.put("id", firstOfPage3.id);
-		ScrollPosition backPosition = ScrollPosition.backward(backKeys);
+		// All 6 unique items across forward pages
+		var allForwardIds = new HashSet<UUID>();
+		allForwardIds.addAll(ids(page1));
+		allForwardIds.addAll(ids(page2));
+		allForwardIds.addAll(ids(page3));
+		assertEquals(6, allForwardIds.size(), "Forward should cover all 6 items without duplicates");
 
-		System.out.println("=== Backward scroll ===");
-		Window<Item> backPage = scroll(repo, backPosition);
-		assertEquals(2, backPage.getContent().size(),
-				"Backward page should have 2 items matching page 2");
+		// Backward from page 3's first item should return page 2's items
+		Window<Item> backFromPage3 = scroll(repo, positionBefore(em, page3.getContent().get(0)));
+		assertEquals(ids(page2), ids(backFromPage3),
+				"Backward from page 3 should return page 2's items");
+
+		// Backward from page 2's first item should return page 1's items
+		Window<Item> backFromPage2 = scroll(repo, positionBefore(em, backFromPage3.getContent().get(0)));
+		assertEquals(ids(page1), ids(backFromPage2),
+				"Backward from page 2 should return page 1's items");
 
 		em.close();
 	}
 
 	/**
-	 * 3 scored + 3 unscored items. Only scored items reachable via pagination.
+	 * 3 scored + 3 unscored items. All 6 should be reachable with no duplicates.
 	 */
 	@Test
 	void mixedNullScores_paginationLosesUnscoredItems() {
@@ -154,20 +171,21 @@ class KeysetScrollNullableColumnTest {
 		var repo = new SimpleJpaRepository<Item, UUID>(entityInfo, em);
 
 		var allItems = new ArrayList<Item>();
+		var allIds = new HashSet<UUID>();
 		ScrollPosition position = ScrollPosition.keyset();
 		while (true) {
 			Window<Item> page = scroll(repo, position);
 			if (page.getContent().isEmpty()) break;
+			for (Item item : page.getContent()) {
+				assertTrue(allIds.add(item.id), "Duplicate item: " + item.title);
+			}
 			allItems.addAll(page.getContent());
-			var last = page.getContent().get(page.getContent().size() - 1);
-			position = positionAfter(em, last);
+			position = positionAfter(em, page.getContent().get(page.getContent().size() - 1));
 		}
 
 		assertEquals(6, allItems.size(),
 				"All 6 items should be reachable, but only found: "
-						+ allItems.stream().map(i -> i.title).toList());
-
-		em.close();
+						+ allItems.stream().map(i -> i.title).collect(Collectors.joining(", ")));
 	}
 
 	@Entity(name = "Item")
