@@ -3,7 +3,6 @@ package org.hibernate.bugs;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.UUID;
 
 import org.junit.jupiter.api.AfterEach;
@@ -20,43 +19,24 @@ import jakarta.persistence.OneToOne;
 import jakarta.persistence.Persistence;
 import jakarta.persistence.PrimaryKeyJoinColumn;
 import jakarta.persistence.Table;
-import jakarta.persistence.criteria.CriteriaBuilder;
-import jakarta.persistence.criteria.CriteriaQuery;
-import jakarta.persistence.criteria.JoinType;
-import jakarta.persistence.criteria.Predicate;
-import jakarta.persistence.criteria.Root;
 
 import org.springframework.data.domain.KeysetScrollPosition;
+import org.springframework.data.domain.Limit;
 import org.springframework.data.domain.ScrollPosition;
 import org.springframework.data.domain.Sort;
-import org.springframework.data.jpa.repository.query.KeysetScrollSpecification;
-import org.springframework.data.jpa.repository.support.JpaEntityInformation;
+import org.springframework.data.domain.Window;
+import org.springframework.data.jpa.domain.Specification;
 import org.springframework.data.jpa.repository.support.JpaMetamodelEntityInformation;
+import org.springframework.data.jpa.repository.support.SimpleJpaRepository;
 
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
- * Demonstrates a bug in Spring Data JPA 4.x {@link KeysetScrollSpecification}
- * where keyset scroll generates incorrect WHERE clauses for nullable LEFT JOIN
- * sort columns when null ordering is not set explicitly on {@link Sort.Order}
- * but is handled by Hibernate's {@code default_null_ordering=last}.
+ * Keyset scroll via Spring Data JPA's {@code findBy().scroll()} generates
+ * incorrect WHERE clauses for nullable LEFT JOIN sort columns.
  * <p>
- * {@code KeysetScrollSpecification.CriteriaBuilderStrategy.compare()} checks
- * {@code isNullsLast(order)} which returns false when {@code NullHandling} is
- * {@code NATIVE}, even though Hibernate IS applying NULLS LAST via its setting.
- * <p>
- * Expected WHERE (and what Hibernate 6.6.x / Spring Data 3.x generated):
- * <pre>
- *   (s.score_value &lt; ?
- *    OR s.score_value IS NULL AND i.sort_order &lt; ?
- *    OR s.score_value IS NULL AND i.sort_order = ? AND i.id &lt; ?)
- * </pre>
- * Actual WHERE (Spring Data 4.x):
- * <pre>
- *   (s.score_value IS NOT NULL
- *    OR s.score_value IS NULL AND i.sort_order &lt; ?
- *    OR s.score_value IS NULL AND i.sort_order = ? AND i.id &lt; ?)
- * </pre>
+ * Items with NULL sort values become unreachable during pagination.
+ * Works correctly with Hibernate 6.6.x / Spring Data 3.x.
  */
 class KeysetScrollNullableColumnTest {
 
@@ -72,51 +52,20 @@ class KeysetScrollNullableColumnTest {
 		entityManagerFactory.close();
 	}
 
-	// No explicit nullsLast() — null ordering is handled by Hibernate's
-	// default_null_ordering=last setting, which Spring Data doesn't know about.
 	private static final Sort SORT = Sort.by(
 			Sort.Order.desc("score.value"),
 			Sort.Order.desc("sortOrder"),
 			Sort.Order.desc("id")
 	);
 
-	/**
-	 * Builds and executes a keyset-scrolled Criteria query using
-	 * {@link KeysetScrollSpecification#createPredicate} — the same code path as
-	 * Spring Data's {@code JpaSpecificationExecutor.findBy(...).scroll(position)}.
-	 */
-	private List<Item> scrollQuery(EntityManager em, KeysetScrollPosition position, int pageSize) {
-		CriteriaBuilder cb = em.getCriteriaBuilder();
-		CriteriaQuery<Item> cq = cb.createQuery(Item.class);
-		Root<Item> root = cq.from(Item.class);
-		root.fetch("score", JoinType.LEFT);
-		var scoreJoin = root.join("score", JoinType.LEFT);
-		cq.select(root);
-
-		// Use KeysetScrollSpecification.createPredicate — the exact Spring Data code path.
-		JpaEntityInformation<Item, ?> entityInfo = new JpaMetamodelEntityInformation<>(
-				Item.class, em.getMetamodel(), em.getEntityManagerFactory().getPersistenceUnitUtil());
-		var spec = new KeysetScrollSpecification<Item>(position, SORT, entityInfo);
-		Predicate predicate = spec.createPredicate(root, cb);
-		if (predicate != null) {
-			cq.where(predicate);
-		}
-
-		// Apply sort using the explicit LEFT JOIN for score.value
-		cq.orderBy(
-				cb.desc(scoreJoin.get("value")),
-				cb.desc(root.get("sortOrder")),
-				cb.desc(root.get("id"))
-		);
-
-		return em.createQuery(cq)
-				.setMaxResults(pageSize)
-				.getResultList();
+	private Window<Item> scroll(SimpleJpaRepository<Item, UUID> repo, ScrollPosition position) {
+		Specification<Item> spec = (root, query, cb) -> null;
+		return repo.findBy(spec, q ->
+				q.limit(2).sortBy(SORT).scroll(position));
 	}
 
-	private KeysetScrollPosition positionAfter(EntityManager em, Item item) {
+	private ScrollPosition positionAfter(EntityManager em, Item item) {
 		var keys = new LinkedHashMap<String, Object>();
-		// Explicitly load score to avoid lazy proxy issues
 		ItemScore score = em.find(ItemScore.class, item.id);
 		keys.put("score.value", score != null ? score.value : null);
 		keys.put("sortOrder", item.sortOrder);
@@ -125,11 +74,10 @@ class KeysetScrollNullableColumnTest {
 	}
 
 	/**
-	 * 6 items with no scores (LEFT JOIN produces NULL).
-	 * Page 1 returns 2 items. Page 2 should return 2 but returns 0.
+	 * 6 items, no scores (LEFT JOIN produces NULL). Forward pagination loses items.
 	 */
 	@Test
-	void allNullScores_forwardPaginationLosesItems() {
+	void allNullScores_paginationLosesItems() {
 		EntityManager em = entityManagerFactory.createEntityManager();
 		em.getTransaction().begin();
 		for (int i = 0; i < 6; i++) {
@@ -141,22 +89,26 @@ class KeysetScrollNullableColumnTest {
 		}
 		em.getTransaction().commit();
 
-		List<Item> page1 = scrollQuery(em, ScrollPosition.keyset(), 2);
-		assertEquals(2, page1.size(), "Page 1 should have 2 items");
+		var entityInfo = new JpaMetamodelEntityInformation<Item, UUID>(
+				Item.class, em.getMetamodel(), em.getEntityManagerFactory().getPersistenceUnitUtil());
+		var repo = new SimpleJpaRepository<Item, UUID>(entityInfo, em);
 
-		List<Item> page2 = scrollQuery(em, positionAfter(em, page1.get(1)), 2);
-		assertEquals(2, page2.size(),
-				"Page 2 should have 2 items — KeysetScrollSpecification generates incorrect " +
-						"keyset predicate when cursor's score is NULL");
+		Window<Item> page1 = scroll(repo, ScrollPosition.keyset());
+		assertEquals(2, page1.getContent().size(), "Page 1 should have 2 items");
+		assertTrue(page1.hasNext(), "Should have more pages");
+
+		Window<Item> page2 = scroll(repo, positionAfter(em, page1.getContent().get(1)));
+		assertEquals(2, page2.getContent().size(),
+				"Page 2 should have 2 items — keyset WHERE clause drops items with NULL scores");
 
 		em.close();
 	}
 
 	/**
-	 * 3 scored + 3 unscored items. Only scored items are reachable via pagination.
+	 * 3 scored + 3 unscored items. Only scored items reachable via pagination.
 	 */
 	@Test
-	void mixedNullScores_forwardPaginationLosesUnscoredItems() {
+	void mixedNullScores_paginationLosesUnscoredItems() {
 		EntityManager em = entityManagerFactory.createEntityManager();
 		em.getTransaction().begin();
 		for (int i = 0; i < 3; i++) {
@@ -181,13 +133,18 @@ class KeysetScrollNullableColumnTest {
 		}
 		em.getTransaction().commit();
 
+		var entityInfo = new JpaMetamodelEntityInformation<Item, UUID>(
+				Item.class, em.getMetamodel(), em.getEntityManagerFactory().getPersistenceUnitUtil());
+		var repo = new SimpleJpaRepository<Item, UUID>(entityInfo, em);
+
 		var allItems = new ArrayList<Item>();
-		KeysetScrollPosition position = ScrollPosition.keyset();
+		ScrollPosition position = ScrollPosition.keyset();
 		while (true) {
-			List<Item> page = scrollQuery(em, position, 2);
-			if (page.isEmpty()) break;
-			allItems.addAll(page);
-			position = positionAfter(em, page.get(page.size() - 1));
+			Window<Item> page = scroll(repo, position);
+			if (page.getContent().isEmpty()) break;
+			allItems.addAll(page.getContent());
+			var last = page.getContent().get(page.getContent().size() - 1);
+			position = positionAfter(em, last);
 		}
 
 		assertEquals(6, allItems.size(),

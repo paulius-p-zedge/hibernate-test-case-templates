@@ -25,6 +25,7 @@
             <property name="hibernate.hbm2ddl.auto" value="create-drop"/>
 
             <property name="hibernate.max_fetch_depth" value="5"/>
+            <property name="hibernate.order_by.default_null_ordering" value="last"/>
 
             <property name="hibernate.cache.region_prefix" value="hibernate.test"/>
             <property name="hibernate.cache.region.factory_class"
